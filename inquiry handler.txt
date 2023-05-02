@@ -1,4 +1,4 @@
-/**
+/**99
  * Test class : InquiryHandler_Test
  * Modified By              | Date                       | Jira          | Notes
  * N/A                      | N/A                        | N/A           | Initial version
