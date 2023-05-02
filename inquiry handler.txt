@@ -1,0 +1,723 @@
+/**
+ * Test class : InquiryHandler_Test
+ * Modified By              | Date                       | Jira          | Notes
+ * N/A                      | N/A                        | N/A           | Initial version
+ * David M                  | 01-30-2023                 | CP-1837       | Fixed minimum days until check-in logic for non-Airbnb inquiries
+ */
+
+public with sharing class InquiryHandler implements InquiryBatchMethods_Interface {
+    // -------- Constants --------
+    public static final String EVOLVE = 'evolve';
+    
+    // Inquiry Stages
+    public static final String INQUIRY_STAGE_LOST = 'Closed-Lost';
+    public static final String INQUIRY_STAGE_DEFAULT = 'Inquiry';
+    public static final String INQUIRY_STAGE_PENDING = 'Pending TA Approval';
+
+    // Inquiry Statuses
+    public static final String INQUIRY_STATUS_LOST = 'Closed-Lost';
+
+    // Inquiry Reasons
+    public static final String INQUIRY_REASON_MISSING_DATA = 'Missing Data';
+    public static final String INQUIRY_REASON_INVALID_LISTING = 'Invalid Listing';
+    public static final String INQUIRY_REASON_INACTIVE_LISTING = 'Inactive Listing';
+    public static final String INQUIRY_REASON_INVALID_DATES = 'Invalid Check-In/Check-Out Dates';
+    public static final String INQUIRY_REASON_BEYOND_DATE_RANGE = 'No Rates available for this time range';
+    public static final String INQUIRY_REASON_INVALID_ADULTS = 'Invalid Number of Adults';
+    public static final String INQUIRY_REASON_UNAVAILABLE = 'Not available for these dates';
+    public static final String INQUIRY_REASON_TURN_DAY = 'Turn Day Restriction';
+    public static final String INQUIRY_REASON_CHECKIN_DAY_RESTRICTION = 'Check-In Day Restriction';
+    public static final String INQUIRY_REASON_CHECKOUT_DAY_RESTRICTION = 'Check-Out Day Restriction';
+    public static final String INQUIRY_REASON_MIN_STAY = 'Minimum Stay';
+    public static final String INQUIRY_REASON_MAX_PEOPLE = 'Maximum Occupancy';
+    public static final String INQUIRY_REASON_RATE_GAP = 'Rate Gap';
+    public static final String INQUIRY_REASON_MODIFICATION_DATA = 'Incorrect information provided for modification';
+    public static final String INQUIRY_REASON_NO_PETS = 'Pets not allowed';
+    public static final String INQUIRY_REASON_WINDOW = 'Booking Window Restriction';
+    public static final String INQUIRY_REASON_PAST_CHECK_IN = 'Past Check-In';
+    public static final String INQUIRY_REASON_PRICING = 'Pricing Issue';
+
+    // Inquiry Messages
+    public static final String INQUIRY_MESSAGE_MISSING_DATA = 'Data required to determine availability is missing';
+    public static final String INQUIRY_MESSAGE_INACTIVE_LISTING = 'The listing is not active at this time';
+    public static final String INQUIRY_MESSAGE_INVALID_LISTING = 'There is no listing for the given ID';
+    public static final String INQUIRY_MESSAGE_MISSING_DATES = 'Missing Check-In/Out Dates';
+    public static final String INQUIRY_MESSAGE_INVALID_DATES = 'Invalid Check-In/Out dates';
+    public static final String INQUIRY_MESSAGE_BEYOND_DATE_RANGE = 'There are no rates available for this time range';
+    public static final String INQUIRY_MESSAGE_INVALID_ADULTS = 'Invalid number of adults';
+    public static final String INQUIRY_MESSAGE_UNAVAILABLE = 'Not available for these dates';
+    public static final String INQUIRY_MESSAGE_TURN_DAY = 'Turn Day Restriction';
+    public static final String INQUIRY_MESSAGE_RATE_GAP = 'Rate Gap';
+    public static final String INQUIRY_MESSAGE_MODIFICATION_DATA = 'Incorrect information provided for modification';
+    public static final String INQUIRY_MESSAGE_WINDOW = 'Check in date did not provide the required minimum time for the listing';
+    public static final String INQUIRY_MESSAGE_PAST_CHECK_IN = 'Past Check-In';
+
+    // Referral Sources
+    public static final String INQUIRY_REFERRAL_SOURCE_TA = 'Tripadvisor';
+
+    // Minimum Booking Window Default
+    public static final Integer MINIMUM_BOOKING_WINDOW = 2;
+
+    // Placeholder
+    public static final String AMENITY_NAME_NO_PETS = 'No Pets Allowed';
+
+    // -------- Constructor --------
+    // None
+
+    // -------- Variables --------
+    // For testing
+    @TestVisible
+    private static Integer testType = 0;
+
+    // -------- Properties --------
+    // None
+
+    // -------- Methods --------
+    // Queries
+    public static Map<Id, Inquiry__c> loadInquiriesByID(Set<Id> inquiryIDs) {
+        Map<Id, Inquiry__c> result = new Map<Id, Inquiry__c>();
+
+        try {
+            result = new Map<Id, Inquiry__c>([
+                    SELECT Id, Listing__c, Check_In__c, Check_Out__c, Listing__r.Billing_Plan__c, Referral_Source__c,
+                            Phone__c, Listing_Channel__c, Stage__c, ImmediateBooking__c, Lead__c, Question__c,
+                            Number_of_Adults__c, Number_of_Children__c, CreatedDate, (SELECT Id FROM Bookings__r)
+                    FROM Inquiry__c
+                    WHERE Id = :inquiryIDs
+            ]);
+
+            if (Test.isRunningTest() && testType == 1) {
+                throw new QueryException('TestFailure');
+            }
+        } catch (QueryException error) {
+            result = new Map<Id, Inquiry__c>();
+            EvolveException.recordException('InquiryHandler', 'loadInquiriesByID', error.getMessage() + ' : ' + error.getStackTraceString());
+        }
+
+        return result;
+    }
+
+    public static Boolean isInternalUser() {
+        if (Test.isRunningTest() && testType == 2) {
+            return false;
+        }
+        return UserInfo.getUserType() == 'Standard' && UserInfo.getUserId() != '00560000002JmOqAAK';
+    }
+
+    // This navigates all the private methods for checking an inquiry availability, responding with an inquiry in either a closed lost status with
+    // requested fields populated, or responding with the inquiry in "Inquiry" status, which means its available; We use two queires, one for the
+    // listing and its children loading, and one for the recalculating values; Don't use for bulk purposes;
+    // Added in a booking ID value to be ignored in loading the current booking when checking availability on modifications
+    private static Map<String, Object> checkAvailabilityInternal(Inquiry__c record, Id modifiedBookingID, Boolean checkForPets, Boolean isModifyTool, String requestDataType) {
+        Inquiry__c inquiry = record;
+
+        InquiryAvailabilityCheck checkAvailabilityHelper = new InquiryAvailabilityCheck(inquiry, modifiedBookingID);
+
+        // Basic data requirements validation
+        checkAvailabilityHelper = validateRequiredDataForCheckAvailability(checkAvailabilityHelper);
+        System.debug('checkAvailabilityHelper: ' + checkAvailabilityHelper);
+        // If basic validation passed, make the quieries we need and set it on our check object
+        if (!checkAvailabilityHelper.isLost) {
+            checkAvailabilityHelper.inquiryListing = loadAvailabilityCheckData(record, checkAvailabilityHelper.existingBookingBeingDateModified, isModifyTool);
+        }
+
+        // Basic availability requirements
+        checkAvailabilityHelper = checkBasicAvailabilityRequirements(checkAvailabilityHelper);
+
+        // Pet check if needed
+        if (checkForPets) {
+            checkAvailabilityHelper = (checkAvailabilityHelper.isLost) ? checkAvailabilityHelper : checkPetsAllowed(checkAvailabilityHelper);
+        }
+
+        // Booking conflicts
+        checkAvailabilityHelper = (checkAvailabilityHelper.isLost) ? checkAvailabilityHelper : checkConflictingBookings(checkAvailabilityHelper);
+
+        // Rule conflicts
+        checkAvailabilityHelper = (checkAvailabilityHelper.isLost) ? checkAvailabilityHelper : checkConflictingRules(checkAvailabilityHelper, isModifyTool, requestDataType);
+        System.debug('checkAvailabilityHelper 3: ' + checkAvailabilityHelper);
+        // Update the inquiry availability response
+        checkAvailabilityHelper.isLost = checkAvailabilityHelper.hasWarnings();
+        if (checkAvailabilityHelper.isLost) {
+            inquiry.Stage__c = INQUIRY_STAGE_LOST;
+            inquiry.Status__c = INQUIRY_STATUS_LOST;
+            inquiry.Reason__c = checkAvailabilityHelper.getFirstWarningReason();
+            inquiry.Message__c = checkAvailabilityHelper.getFirstWarningMessage();
+            inquiry.Min_Stay_Error__c = checkAvailabilityHelper.minStayErrorDayNumber;
+            inquiry.Max_Occupancy_Error__c = checkAvailabilityHelper.maxOccErrorPeopleNumber;
+        } else {
+            inquiry.Stage__c = INQUIRY_STAGE_DEFAULT;
+        }
+
+        Map<String, Object> result = new Map<String, Object>();
+        result.put('Inquiry__c', inquiry);
+        result.put('InquiryAvailabilityCheck', checkAvailabilityHelper);
+        return result;
+    }
+
+    public static Inquiry__c checkAvailability(Inquiry__c record, Id modifiedBookingID, Boolean checkForPets) {
+        return (Inquiry__c) checkAvailabilityInternal(record, modifiedBookingID, checkForPets, false, '').get('Inquiry__c');
+    }
+
+    public static InquiryAvailabilityCheck checkAvailabilityReturnInquiryAvailabilityCheck(Inquiry__c record, Id modifiedBookingID, Boolean checkForPets, String requestDataType) {
+        return checkAvailabilityReturnInquiryAvailabilityCheck(record, modifiedBookingID, checkForPets, false, requestDataType);
+    }
+
+    public static InquiryAvailabilityCheck checkAvailabilityReturnInquiryAvailabilityCheck(Inquiry__c record, Id modifiedBookingID, Boolean checkForPets, Boolean isModifyTool, String requestDataType) {
+        return (InquiryAvailabilityCheck) checkAvailabilityInternal(record, modifiedBookingID, checkForPets, isModifyTool, requestDataType).get('InquiryAvailabilityCheck');
+    }
+
+    // Validate the basic required data, or throw error to the requesting class
+    private static InquiryAvailabilityCheck validateRequiredDataForCheckAvailability(InquiryAvailabilityCheck record) {
+        InquiryAvailabilityCheck result = record;
+        System.debug(':::' + record.existingBookingBeingDateModified);
+        System.debug(':::' + record.inquiry.Listing__c);
+        System.debug(':::' + record.inquiry.Number_of_Adults__c);
+        System.debug(':::' + record.inquiry.Number_of_Children__c);
+        System.debug(':::' + record.inquiry.Stage__c);
+        if (record.inquiry == null) {
+            throw new EvolveException('An inquiry record must be passed to the InquiryHandler.checkAvailability method.');
+        } else if (record.existingBookingBeingDateModified == null &&
+                (record.inquiry.Listing__c == null || record.inquiry.Number_of_Adults__c == null || record.inquiry.Number_of_Children__c == null || record.inquiry.Stage__c != null)) {
+            result.addWarning(INQUIRY_REASON_MISSING_DATA, INQUIRY_MESSAGE_MISSING_DATA, false);
+        } else if (record.existingBookingBeingDateModified != null && (record.inquiry.Listing__c == null || record.inquiry.Number_of_Adults__c == null || record.inquiry.Number_of_Children__c == null)) {
+            result.addWarning(INQUIRY_REASON_MODIFICATION_DATA, INQUIRY_MESSAGE_MODIFICATION_DATA, false);
+        }
+
+        return result;
+    }
+
+    private static Map<Id, Listing__c> loadAvailabilityCheckData(Inquiry__c record, Id modifiedBookingID, Boolean isModifyTool) {
+        Map<Id, Listing__c> result = new Map<Id, Listing__c>();
+
+        try {
+            Date checkInDateForTurnDays = record.Check_In__c?.addDays(-7);
+            Date checkOutDateForTurnDays = record.Check_Out__c?.addDays(7);
+            Date todayUTC = Date_Utilities.todayUTC();
+            Boolean isPastCheckIn = false;
+
+            if(todayUTC > record.Check_In__c && isModifyTool) {
+                todayUTC = record.Check_In__c;
+                isPastCheckIn = true;
+            }
+
+            result = new Map<Id, Listing__c>([
+                    SELECT Id, Status__c, Min_Stay__c, Max_Occupancy__c, Minimum_Days_Until_Check_In__c, checkin_time_24hr__c, Listing_Timezone__c, (
+                            SELECT Id, Listing__c, Check_In__c, Check_Out__c, Status__c
+                            FROM Bookings__r
+                            WHERE Id != :modifiedBookingID AND Status__c NOT IN:BookingHandler.BOOKING_STATUS_CANCELLED
+                            AND ((Check_In__c <= :checkInDateForTurnDays AND Check_Out__c >= :checkOutDateForTurnDays)
+                            OR (
+                                    (Check_In__c >= :checkInDateForTurnDays AND Check_In__c <= :checkOutDateForTurnDays)
+                                    OR (Check_Out__c >= :checkInDateForTurnDays AND Check_Out__c <= :checkOutDateForTurnDays))
+                            )
+                    ), (
+                            SELECT Id, Start_Check_In_During__c, Check_In_During_End_Date__c, Active__c, Turn_Day__c, Start_Date__c, End_Date__c,
+                                    Check_In_Day_PM__c, Check_Out_Day_AM__c, Min_Stay_Days__c, Max_Occupancy__c, RecordTypeId, Number_of_Turn_Days__c
+                            FROM Booking_Rules__r
+                            WHERE (Active__c = TRUE OR Active__c != :isPastCheckIn)
+                            AND Start_Date__c <= :Date_Utilities.todayUTC() AND End_Date__c >= :todayUTC AND Check_In_During_End_Date__c >= :todayUTC
+                            AND (RecordTypeId IN ( :BookingRuleHandler.RECORD_TYPE_RATES, :BookingRuleHandler.RECORD_TYPE_RULES ))
+                            AND (
+                                    (Start_Check_In_During__c <= :record.Check_In__c AND Check_In_During_End_Date__c >= :record.Check_Out__c)
+                                    OR (
+                                            (Start_Check_In_During__c >= :record.Check_In__c AND Start_Check_In_During__c <= :record.Check_Out__c)
+                                            OR (Check_In_During_End_Date__c >= :record.Check_In__c AND Check_In_During_End_Date__c <= :record.Check_Out__c)))
+                    ), (
+                            SELECT Amenity__r.Amenity_Name__c
+                            FROM Listing__c.Amenities_or_Policies__r
+                            WHERE Amenity__r.Amenity_Name__c = :AMENITY_NAME_NO_PETS
+                            AND Active__c = TRUE
+                    )
+                    FROM Listing__c
+                    WHERE Id = :record.Listing__c
+            ]);
+        } catch (QueryException error) {
+            EvolveException.recordException('InquiryHandler', 'loadAvailabilityCheckData', error);
+        }
+
+        return result;
+    }
+
+    // Check basic requirements for inquiry availability
+    private static InquiryAvailabilityCheck checkBasicAvailabilityRequirements(InquiryAvailabilityCheck record) {
+        InquiryAvailabilityCheck result = record;
+            System.debug('1>>: ' +record);
+
+        if (result.inquiryListing.containsKey(result.inquiry.Listing__c)) {
+            if (result.inquiryListing.get(result.inquiry.Listing__c).Status__c != ListingHandler.STATUS_ACTIVE) {
+                result.addWarning(INQUIRY_REASON_INACTIVE_LISTING, INQUIRY_MESSAGE_INACTIVE_LISTING, false);
+                    System.debug('2>>: ');
+            }
+             System.debug('22>>: ');
+        } else {
+            result.addWarning(INQUIRY_REASON_INVALID_LISTING, INQUIRY_MESSAGE_INVALID_LISTING, false);
+                                System.debug('3>>: ');
+
+        }
+
+        if (result.inquiry.Check_In__c == null || result.inquiry.Check_Out__c == null) {
+            result.addWarning(INQUIRY_REASON_INVALID_DATES, INQUIRY_MESSAGE_MISSING_DATES, false);
+                                            System.debug('4>>: ');
+
+        } else if (result.inquiry.Check_In__c > result.inquiry.Check_Out__c) {
+            result.addWarning(INQUIRY_REASON_INVALID_DATES, INQUIRY_MESSAGE_INVALID_DATES, false);
+                                            System.debug('5>>: ');
+
+        } else if (result.inquiry.Check_In__c > Date.today().addDays(395) && !isInternalUser()) {
+            result.addWarning(INQUIRY_REASON_BEYOND_DATE_RANGE, INQUIRY_MESSAGE_BEYOND_DATE_RANGE, false);
+                                            System.debug('6>>: ');
+
+        }
+
+        if (result.inquiry.Number_of_Adults__c == 0) {
+            result.addWarning(INQUIRY_REASON_INVALID_ADULTS, INQUIRY_MESSAGE_INVALID_ADULTS, false);
+                                            System.debug('7>>: ');
+
+        }
+                                System.debug('8>>: ');
+
+        result.isLost = result.hasWarnings();
+
+        return result;
+    }
+
+    // For doing the hack check of no pets allowed against amenities; Currently is the only policy we load
+    // so just have to chck if one was loaded
+    private static InquiryAvailabilityCheck checkPetsAllowed(InquiryAvailabilityCheck record) {
+        InquiryAvailabilityCheck result = record;
+
+        if (result.inquiryListing.containsKey(result.inquiry.Listing__c)) {
+            if (result.inquiryListing.get(result.inquiry.Listing__c).Amenities_or_Policies__r != null &&
+                    !result.inquiryListing.get(result.inquiry.Listing__c).Amenities_or_Policies__r.isEmpty()) {
+                result.addWarning(INQUIRY_REASON_NO_PETS, INQUIRY_REASON_NO_PETS, true);
+            }
+        }
+
+        return result;
+    }
+
+    // Check if other bookings are present - turn day bookings are recorded here but checked with rules, only a booking thats consumes a
+    // non turn day (check in / check out) would be rejected here
+    private static InquiryAvailabilityCheck checkConflictingBookings(InquiryAvailabilityCheck record) {
+        InquiryAvailabilityCheck result = record;
+        if (result.inquiry.Listing__c == null) {
+            return result;
+        }
+
+        Set<Date> inquieyDates = Date_Utilities.datesBetweenAndIncluding(result.inquiry.Check_In__c, result.inquiry.Check_Out__c);
+        Set<Date> bookingsDates = new Set<Date>();
+
+        if (result.inquiryListing.get(result.inquiry.Listing__c).Bookings__r != null && !result.inquiryListing.get(result.inquiry.Listing__c).Bookings__r.isEmpty()) {
+            Boolean isWarning = false;
+            for (Booking__c bookingRecord : result.inquiryListing.get(result.inquiry.Listing__c).Bookings__r) {
+                if (bookingRecord.Id == result.existingBookingBeingDateModified) {
+                    continue;
+                }
+
+                if ((bookingRecord.Check_In__c <= result.inquiry.Check_In__c && bookingRecord.Check_Out__c >= result.inquiry.Check_Out__c) ||
+                        ((bookingRecord.Check_In__c > result.inquiry.Check_In__c && bookingRecord.Check_In__c < result.inquiry.Check_Out__c) ||
+                                (bookingRecord.Check_Out__c > result.inquiry.Check_In__c && bookingRecord.Check_Out__c < result.inquiry.Check_Out__c))) {
+                    bookingsDates.addAll(Date_Utilities.datesBetweenAndIncluding(bookingRecord.Check_In__c, bookingRecord.Check_Out__c));
+                    if(!isWarning) {
+                        result.addWarning(INQUIRY_REASON_UNAVAILABLE, INQUIRY_MESSAGE_UNAVAILABLE, true);
+                        isWarning = true;
+                    }
+                } else if (bookingRecord.Check_In__c == result.inquiry.Check_Out__c || bookingRecord.Check_Out__c == result.inquiry.Check_In__c) {
+                    result.turnDayCheckInBookingFound = bookingRecord.Check_Out__c == result.inquiry.Check_In__c;
+                    result.turnDayCheckOutBookingFound = bookingRecord.Check_In__c == result.inquiry.Check_Out__c;
+                }
+            }
+        }
+
+        Set<Date> conflictDates = new Set<Date>();
+        for (Date d : inquieyDates) {
+            if (bookingsDates.contains(d)) {
+                conflictDates.add(d);
+            }
+        }
+
+        if (!conflictDates.isEmpty()) {
+            List<AvailabilityDetails> availabilityDetails = result.availabilityDetails;
+
+            AvailabilityDetails details = new AvailabilityDetails();
+            details.conflictBookingDates = new List<Date>(conflictDates);
+            availabilityDetails.add(details);
+
+            result.availabilityDetails = availabilityDetails;
+        }
+
+        return result;
+    }
+
+    // Next step is to check out booking rule validations for rates and rules that apply to the time frame;
+    // And in some conditions, check the listing values of no booking rules are present to validate against;
+    private static InquiryAvailabilityCheck checkConflictingRules(InquiryAvailabilityCheck record, Boolean isModifyTool, String requestDataType) {
+        InquiryAvailabilityCheck result = record;
+
+        Boolean ruleViolation = false;
+        Boolean listingRuleViolation = false;
+        Boolean rateGapViolation = false;
+        Boolean useListingMinStay = true;
+        Boolean useListingMaxOccupancy = true;
+        Boolean useListingBookingWindow = (record.existingBookingBeingDateModified == null) ? true : false;
+
+        Integer totalNights = result.inquiry.Check_In__c.daysBetween(result.inquiry.Check_Out__c);
+
+        Set<Date> ratesAvailableForTheseDates = new Set<Date>();
+
+        Date lastCheckOut = null;
+        Date nextCheckIn = null;
+        if (result.inquiryListing.get(result.inquiry.Listing__c).Bookings__r != null && !result.inquiryListing.get(result.inquiry.Listing__c).Bookings__r.isEmpty()) {
+            for (Booking__c bookingRecord : result.inquiryListing.get(result.inquiry.Listing__c).Bookings__r) {
+                if (bookingRecord.Id == result.existingBookingBeingDateModified) {
+                    continue;
+                }
+                if (bookingRecord.Check_Out__c >= result.inquiry.Check_In__c.addDays(-7) && bookingRecord.Check_Out__c <= result.inquiry.Check_In__c) {
+                    if (lastCheckOut == null || lastCheckOut <= bookingRecord.Check_Out__c) {
+                        lastCheckOut = bookingRecord.Check_Out__c;
+                    }
+                }
+                if (bookingRecord.Check_In__c <= result.inquiry.Check_Out__c.addDays(7) && bookingRecord.Check_In__c >= result.inquiry.Check_Out__c) {
+                    if (nextCheckIn == null || nextCheckIn >= bookingRecord.Check_In__c) {
+                        nextCheckIn = bookingRecord.Check_In__c;
+                    }
+                }
+            }
+        }
+
+        if (result.inquiryListing.get(result.inquiry.Listing__c).Booking_Rules__r != null &&
+                !result.inquiryListing.get(result.inquiry.Listing__c).Booking_Rules__r.isEmpty()) {
+            List<AvailabilityDetails> availabilityDetails = result.availabilityDetails;
+
+            for (BookingRule__c bookingRule : result.inquiryListing.get(result.inquiry.Listing__c).Booking_Rules__r) {
+                Boolean isTurnDayBookingRule = bookingRule.Turn_Day__c && bookingRule.RecordTypeId == BookingRuleHandler.RECORD_TYPE_RULES;
+                Integer numberOfTurnDays = bookingRule.Number_of_Turn_Days__c == null ? 1 : Integer.valueOf(bookingRule.Number_of_Turn_Days__c);
+                Set<Date> dateRangeOfRule = Date_Utilities.datesBetweenAndIncluding(bookingRule.Start_Check_In_During__c, bookingRule.Check_In_During_End_Date__c);
+                // For rates, collect the earliest rate start date and the latest rate end date
+                if (bookingRule.RecordTypeId == BookingRuleHandler.RECORD_TYPE_RATES) {
+                    ratesAvailableForTheseDates.addAll(dateRangeOfRule);
+                }
+                // For Rule type booking rules, run a variety of checks
+                else if (bookingRule.RecordTypeId == BookingRuleHandler.RECORD_TYPE_RULES) {
+                    // If a min stay rule is present and doesn't start on the same day as inquiry check-in, it overrides the default listing min stay
+                    if (!isModifyTool && bookingRule.Min_Stay_Days__c != null && bookingRule.Start_Check_In_During__c != result.inquiry.Check_Out__c) {
+                        useListingMinStay = false;
+
+                        if (totalNights < bookingRule.Min_Stay_Days__c) {
+                            AvailabilityDetails details = new AvailabilityDetails();
+                            details.min_nights = bookingRule.Min_Stay_Days__c;
+                            details.conflictRuleDays = new List<Date>(dateRangeOfRule);
+                            availabilityDetails.add(details);
+
+                            ruleViolation = true;
+                            result.minStayErrorDayNumber = bookingRule.Min_Stay_Days__c;
+                            if(requestDataType == EVOLVE)
+                            {
+                                result.addWarning(INQUIRY_REASON_MIN_STAY, 'Min Stay of ' + bookingRule.Min_Stay_Days__c + ' Requested ' + totalNights, true, bookingRule.Min_Stay_Days__c, totalNights);
+                            }
+                        }
+                    }
+
+                    // As above, with max occupancy
+                    if (bookingRule.Max_Occupancy__c != null) {
+                        useListingMaxOccupancy = false;
+
+                        if ((result.inquiry.Number_of_Adults__c + result.inquiry.Number_of_Children__c) > bookingRule.Max_Occupancy__c) {
+                            ruleViolation = true;
+                            Decimal totalOccupancy = result.inquiry.Number_of_Adults__c + result.inquiry.Number_of_Children__c;
+                            result.maxOccErrorPeopleNumber = bookingRule.Max_Occupancy__c;
+                            if(requestDataType == EVOLVE)
+                            {
+                                result.addWarning(INQUIRY_REASON_MAX_PEOPLE, 'Max Occupancy of ' + bookingRule.Max_Occupancy__c + ' Requested ' + totalOccupancy, true, bookingRule.Max_Occupancy__c, totalOccupancy);
+                            }
+                        }
+                    }
+
+                    if (bookingRule.Start_Check_In_During__c != result.inquiry.Check_Out__c) {
+                        // Check in day restriction
+                        String checkInDayOfWeek = Date_Utilities.retrieveDayOfWeek(result.inquiry.Check_In__c);
+                        if (bookingRule.Check_In_Day_PM__c != null && bookingRule.Check_In_Day_PM__c != 'None' &&
+                            bookingRule.Check_In_Day_PM__c != checkInDayOfWeek) {
+                                ruleViolation = true;
+                                if(requestDataType == EVOLVE)
+                                {
+                                    result.addWarning(INQUIRY_REASON_CHECKIN_DAY_RESTRICTION, 'Check-In Day Restriction of ' + bookingRule.Check_In_Day_PM__c + ' Requested ' + checkInDayOfWeek, true, bookingRule.Check_In_Day_PM__c, checkInDayOfWeek);
+                                }
+                            }
+                        // Check out day restriction
+                        String checkOutDayOfWeek = Date_Utilities.retrieveDayOfWeek(result.inquiry.Check_Out__c);
+                        if (bookingRule.Check_Out_Day_AM__c != null && bookingRule.Check_Out_Day_AM__c != 'None' &&
+                            bookingRule.Check_Out_Day_AM__c != checkOutDayOfWeek) {
+                                ruleViolation = true;
+                                if(requestDataType == EVOLVE)
+                                {
+                                    result.addWarning(INQUIRY_REASON_CHECKOUT_DAY_RESTRICTION, 'Check-Out Day Restriction of ' + bookingRule.Check_Out_Day_AM__c + ' Requested ' + checkOutDayOfWeek, true, bookingRule.Check_Out_Day_AM__c, checkOutDayOfWeek);
+                                } 
+                            }
+                    }
+                    // Turn day booking not allowed
+                    if (isTurnDayBookingRule
+                            && dateRangeOfRule.contains(result.inquiry.Check_In__c)
+                            && dateRangeOfRule.contains(result.inquiry.Check_Out__c)
+                            && ((lastCheckOut != null && result.inquiry.Check_In__c.addDays(-numberOfTurnDays) < lastCheckOut && result.inquiry.Check_In__c >= lastCheckOut)
+                            || (nextCheckIn != null && result.inquiry.Check_Out__c.addDays(numberOfTurnDays) > nextCheckIn && result.inquiry.Check_Out__c <= nextCheckIn))) {
+                        System.debug('enter isTurnDayBookingRule');
+                        ruleViolation = true;
+                        result.addWarning(INQUIRY_REASON_TURN_DAY, INQUIRY_MESSAGE_TURN_DAY, true);
+                        result.turnDayBookingFound = true;
+                    }
+                }
+            }
+            result.availabilityDetails = availabilityDetails;
+        } else {
+            rateGapViolation = true;
+            result.addWarning(INQUIRY_REASON_RATE_GAP, INQUIRY_MESSAGE_RATE_GAP, true);
+        }
+
+        // Check for rate gap bomb or rule violation, and with none, check the listing default rules
+        if (!ruleViolation && !rateGapViolation) {
+            // Check default listing values since no existing booking rules, if any, were broken
+            if (!isModifyTool && useListingMinStay && result.inquiryListing.get(result.inquiry.Listing__c).Min_Stay__c != null && totalNights < result.inquiryListing.get(result.inquiry.Listing__c).Min_Stay__c) {
+                listingRuleViolation = true;
+                Decimal actualMinStay = result.inquiryListing.get(result.inquiry.Listing__c).Min_Stay__c;
+                result.minStayErrorDayNumber = actualMinStay;
+                if(requestDataType == EVOLVE)
+                {
+                    result.addWarning(INQUIRY_REASON_MIN_STAY, 'Min Stay of ' + actualMinStay + ' Requested ' + totalNights, true, actualMinStay, totalNights);
+                }
+            }
+            
+            if (useListingMaxOccupancy && result.inquiryListing.get(result.inquiry.Listing__c).Max_Occupancy__c != null &&
+                (result.inquiry.Number_of_Adults__c + result.inquiry.Number_of_Children__c) > result.inquiryListing.get(result.inquiry.Listing__c).Max_Occupancy__c) {
+                    listingRuleViolation = true;
+                    Decimal actualMaxOccupancy = result.inquiryListing.get(result.inquiry.Listing__c).Max_Occupancy__c;
+                    Decimal totalOccupancy = result.inquiry.Number_of_Adults__c + result.inquiry.Number_of_Children__c;
+                    result.maxOccErrorPeopleNumber = actualMaxOccupancy;
+                    if(requestDataType == EVOLVE)
+                    {
+                        result.addWarning(INQUIRY_REASON_MAX_PEOPLE, 'Max Occupancy of ' + actualMaxOccupancy + ' Requested ' + totalOccupancy, true, actualMaxOccupancy, totalOccupancy);
+                    }
+                }
+            
+            if (useListingBookingWindow) {
+                Integer minimumDays = (String.isBlank(result.inquiryListing.get(result.inquiry.Listing__c).Minimum_Days_Until_Check_In__c)) ?
+                    MINIMUM_BOOKING_WINDOW : Integer.valueOf(result.inquiryListing.get(result.inquiry.Listing__c).Minimum_Days_Until_Check_In__c);
+
+                if (result.inquiry.Referral_Source__c == BookingHandler.REFERRAL_SOURCE_BOOKINGCOM
+                        || result.inquiry.Referral_Source__c == BookingHandler.REFERRAL_SOURCE_RENTALS_UNITED
+                        || result.inquiry.Referral_Source__c == BookingHandler.REFERRAL_SOURCE_STAY_SENSE
+                        || result.inquiry.Referral_Source__c == BookingHandler.REFERRAL_SOURCE_HVMI
+                        || result.inquiry.Referral_Source__c == BookingHandler.REFERRAL_SOURCE_HOPPER
+                        || result.inquiry.Referral_Source__c == BookingHandler.REFERRAL_SOURCE_MARRIOTT
+                        || result.inquiry.Referral_Source__c == BookingHandler.REFERRAL_SOURCE_EXPEDIA
+                        || result.inquiry.Referral_Source__c == BookingHandler.REFERRAL_SOURCE_ABNB
+                        || result.inquiry.Referral_Source__c == BookingHandler.REFERRAL_SOURCE_VRBO) {
+                    Integer minimumHoursByDays = minimumDays * 24;
+
+                    Datetime localTime = Datetime.now();
+
+                    String t = result.inquiryListing.get(result.inquiry.Listing__c).checkin_time_24hr__c;
+                    Integer hour = Integer.valueOf(t.split(':')[0]);
+                    Integer minute = Integer.valueOf(t.split(':')[1]);
+                    localTime = Datetime.newInstanceGmt(localTime.yearGmt(), localTime.monthGmt(), localTime.dayGmt(), hour, minute, 0);
+
+                    String timezoneIdTemp = result.inquiryListing.get(result.inquiry.Listing__c)?.Listing_Timezone__c;
+                    String timezoneId = timezoneIdTemp == null ? 'MST' : timezoneIdTemp;
+                    TimeZone tz = TimeZone.getTimeZone(timezoneId);
+
+                    Integer timezoneOffset = tz.getOffset(localTime) / 1000 / 60 / 60;
+
+                    Datetime localTimeInGmt = localTime.addHours(-timezoneOffset);
+                    Datetime currentTimeGmt = Datetime.now();
+                    Datetime checkInWithLocalTime = Datetime.newInstance(result.inquiry.Check_In__c, localTimeInGmt.time());
+
+                    if (checkInWithLocalTime <= currentTimeGmt.addHours(minimumHoursByDays)) {
+                        listingruleviolation = true;
+                        result.addwarning(inquiry_reason_window, inquiry_message_window, true);
+                    }
+                } else if (result.inquiry.Check_In__c <= Date.today().addDays(minimumDays)) {
+                    listingRuleViolation = true;
+                    result.addWarning(INQUIRY_REASON_WINDOW, INQUIRY_MESSAGE_WINDOW, true);
+                }
+            }
+        }
+
+        // Check for no prevous violations, and if none exist, check for rate gaps missing
+        if (!ruleViolation && !rateGapViolation && !listingRuleViolation) {
+            // We charge by night, not day, so subtract one day from check out since that day does not need a rate
+            Set<Date> inquiryDates = Date_Utilities.datesBetweenAndIncluding(result.inquiry.Check_In__c, result.inquiry.Check_Out__c.addDays(-1));
+
+            // Make sure all rate dates are covered
+            for (Date inquiryDate : inquiryDates) {
+                if (!ratesAvailableForTheseDates.contains(inquiryDate)) {
+                    rateGapViolation = true;
+                    result.addWarning(INQUIRY_REASON_RATE_GAP, INQUIRY_MESSAGE_RATE_GAP, true);
+                    break;
+                }
+            }
+        }
+
+        return result;
+    }
+
+    public Inquiry__c checkListingAvailability(Inquiry__c record, Id modifiedBookingId, Boolean checkForPets) {
+        return checkAvailability(record, modifiedBookingId, checkForPets);
+    }
+
+    @AuraEnabled
+    public static Map<String, Object> getInquiryPaymentDetails(Id inquiryId) {
+        System.debug(inquiryId);
+        Map<String, Object> result = new Map<String, Object>();
+
+        Inquiry__c inq = [
+                SELECT Id, Check_In__c, Total_Quote_Amount__c, Listing__r.Cancellation_Policy_Plan__c, Referral_Source__c, (SELECT Id, Quantity__c FROM Inquiry_Line_Items__r)
+                FROM Inquiry__c
+                WHERE Id = :inquiryId
+        ];
+
+        TransactionSuiteFacade.TransactionSuiteResponse transactionSuiteResponse = new TransactionSuiteFacade.TransactionSuiteResponse();
+        TransactionSuiteFacade.TransactionSuiteData payload = new TransactionSuiteFacade.TransactionSuiteData();
+        payload.initatingFlowName = TransactionSuiteFactory.INQUIRY;
+        payload.inquiryID = inquiryId;
+
+        Date finalPaymentDate = null;
+        if (!inq.Inquiry_Line_Items__r.isEmpty()) {
+            for (Inquiry_Line_Item__c lineItem : inq.Inquiry_Line_Items__r) {
+                if (lineItem.Quantity__c > 0) {
+                    payload.inquiryLineItemIDs.add(lineItem.Id);
+                }
+            }
+            transactionSuiteResponse = TransactionSuiteFacade.createTransactions(payload);
+            if (transactionSuiteResponse.cancelledTransactions != null) {
+                for (bt_stripe__Transaction__c tr : transactionSuiteResponse.cancelledTransactions) {
+                    Date dueDate = tr.bt_stripe__Due_Date__c;
+                    if (finalPaymentDate == null || finalPaymentDate < dueDate) {
+                        finalPaymentDate = dueDate;
+                    }
+                }
+            }
+        }
+
+        List<Cancellation_Policy__c> cancellationPolicies = [
+                SELECT Id, Distribution__c, Distribution_Code__c, Cancel_Policy_Description__c, Cancellation_Policy_Plan__r.Default_Plan__c
+                FROM Cancellation_Policy__c
+                WHERE Cancellation_Policy_Plan__c = :inq.Listing__r.Cancellation_Policy_Plan__c
+                AND Distribution__c = :inq.Referral_Source__c AND Start_Date__c <= :inq.Check_In__c AND End_Date__c >= :inq.Check_In__c
+        ];
+
+        result.put('totalQuoteAmount', finalPaymentDate != null ? (transactionSuiteResponse.amountDueNow + transactionSuiteResponse.amountDueLater) : null);
+        result.put('amountDueNow', finalPaymentDate != null ? transactionSuiteResponse.amountDueNow : null);
+        result.put('amountDueLater', finalPaymentDate != null ? transactionSuiteResponse.amountDueLater : null);
+        result.put('finalPaymentDate', finalPaymentDate);
+        result.put('cancellationPolicy', !cancellationPolicies.isEmpty() ? cancellationPolicies[0] : null);
+
+        if (finalPaymentDate != null) {
+            Integer beforeChechIn = finalPaymentDate.daysBetween(inq.Check_In__c);
+            result.put('beforeCheckIn', beforeChechIn > 0 ? beforeChechIn : 0);
+        }
+
+        System.debug(result);
+
+        return result;
+    }
+
+    // -------- Classes --------
+    // This object is passed around the various check availability methods for both current work and future additions
+    // Internal for now
+    public class InquiryAvailabilityCheck {
+        public InquiryAvailabilityCheck(Inquiry__c record, Id modifiedBookingID) {
+            inquiry = record;
+            inquiryListing = new Map<Id, Listing__c>();
+            isLost = false;
+            turnDayBookingFound = false;
+            existingBookingBeingDateModified = modifiedBookingID;
+            errors = new List<InquiryAvailabilityError>();
+            hasNotOverridable = false;
+            availabilityDetails = new List<AvailabilityDetails>();
+        }
+
+        public Inquiry__c inquiry { get; set; }
+        public Map<Id, Listing__c> inquiryListing { get; set; }
+        public Boolean isLost { get; set; }
+        public String reason { get; set; }
+        public String message { get; set; }
+        public Boolean turnDayBookingFound { get; set; }
+        public Boolean turnDayCheckInBookingFound { get; set; }
+        public Boolean turnDayCheckOutBookingFound { get; set; }
+        public Decimal minStayErrorDayNumber { get; set; }
+        public Decimal maxOccErrorPeopleNumber { get; set; }
+        public Id existingBookingBeingDateModified { get; set; }
+        public List<AvailabilityDetails> availabilityDetails { get; set; }
+        private List<InquiryAvailabilityError> errors;
+        private Boolean hasNotOverridable;
+
+        public void addWarning(String reason, String message, Boolean isOverridable, Object checkAgainstValue, Object providedValue) {
+            errors.add(new InquiryAvailabilityError(reason, message, isOverridable, checkAgainstValue, providedValue));
+            if (!isOverridable) {
+                hasNotOverridable = true;
+            }
+        }
+
+        public void addWarning(String reason, String message, Boolean isOverridable) {
+            addWarning(reason, message, isOverridable, null, null);
+        }
+
+        public Boolean hasWarnings() {
+            return !errors.isEmpty();
+        }
+
+        public String getFirstWarningReason() {
+            return errors.isEmpty() ? null : errors.get(0).reason;
+        }
+
+        public String getFirstWarningMessage() {
+            return errors.isEmpty() ? null : errors.get(0).message;
+        }
+
+        public InquiryAvailabilityError getFirstWarning() {
+            return errors.isEmpty() ? null : errors.get(0);
+        }
+
+        public List<String> getWarnings() {
+            List<String> warnings = new List<String>();
+            for (InquiryAvailabilityError error : errors) {
+                warnings.add(error.message);
+            }
+            return warnings;
+        }
+
+        public List<InquiryAvailabilityError> getErrors() {
+            return errors;
+        }
+
+        public Boolean hasNotOverridable() {
+            return hasNotOverridable;
+        }
+    }
+
+    public class InquiryAvailabilityError {
+        public String reason { get; private set; }
+        public String message { get; private set; }
+        public Boolean isOverridable { get; private set; }
+        public Object checkAgainstValue { get; private set; }
+        public Object providedValue { get; private set; }
+
+        public InquiryAvailabilityError(String reason, String message, Boolean isOverridable, Object checkAgainstValue, Object providedValue) {
+            this.reason = reason;
+            this.message = message;
+            this.isOverridable = isOverridable;
+            this.checkAgainstValue = checkAgainstValue;
+            this.providedValue = providedValue;
+        }
+    }
+
+    public class AvailabilityDetails {
+        public AvailabilityDetails() {
+            conflictBookingDates = new List<Date>();
+            conflictRuleDays = new List<Date>();
+        }
+        public Decimal min_nights { get; set; }
+        public List<Date> conflictBookingDates { get; set; }
+        public List<Date> conflictRuleDays { get; set; }
+    }
+}
